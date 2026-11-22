@@ -1,6 +1,7 @@
 """数据导出管理领域服务：分析结果的导出配置、格式转换与异步任务。"""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.services.base import BaseModuleService
@@ -43,11 +44,34 @@ class DataExportService(BaseModuleService):
                 "compression": "snappy", "path": f"exports/{task_id}/data.snappy.parquet"}
 
     def archive_export_to_storage(self, task_id: int) -> dict[str, Any]:
-        """将完成的导出任务归档到长期存储，保留历史版本供回溯。"""
+        """将完成的导出任务归档到长期存储，保留历史版本供回溯。
+
+        存档地址带归档代次，同一任务多次归档可以辨别是哪次保存的；
+        预测结果导出委托预测归档索引登记，回读时按索引找到实际那份数据。
+        """
         task = store.find(self.MODULE, task_id)
         if task is None:
             return {"ok": False}
-        archive_path = f"archive/exports/{task_id}/v1.0/"
+        matched = re.fullmatch(r"predict_task_(\d+)", str(task.get("数据来源", "")))
+        if matched:
+            from app.services import service_for
+            predict_service = service_for("predict_batch")
+            archived = predict_service.archive_predictions(
+                int(matched.group(1)), operator="归档人员")
+            if not archived.get("ok"):
+                return {"ok": False, "message": archived.get("message", "预测归档失败")}
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "archive_id": archived["archive_id"],
+                "generation": archived["generation"],
+                "archive_path": archived["archive_path"],
+                "format": task.get("导出格式"),
+                "message": f"导出任务 {task_id} 已归档至 {archived['archive_path']}",
+            }
+        seq_table = store.internal("export_archive_seq", {})
+        seq_table[task_id] = seq_table.get(task_id, 0) + 1
+        archive_path = f"archive/exports/{task_id}/gen-{seq_table[task_id]:03d}/"
         return {
             "ok": True,
             "task_id": task_id,

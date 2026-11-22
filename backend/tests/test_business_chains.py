@@ -232,6 +232,113 @@ def test_chain9_corr_to_selection():
     assert_ok(r3, "push_selected_to_iv_analysis")
 
 
+# ── 辅助链路10: 预测归档索引 + 历史回读一致性 ──
+def test_chain10_predict_archive_recall():
+    """验证: 预测归档两阶段确认、冲突可恢复副本识别、改分后两代回查的完整链路"""
+    svc_registry = service_for("model_registry")
+    svc_predict = service_for("predict_batch")
+    svc_export = service_for("data_export")
+
+    # Step 0: 部署模型创建预测任务并执行，产出已生成结果
+    r0 = svc_registry.deploy_and_predict(3)
+    assert_ok(r0, "deploy_and_predict")
+    task_id = r0.get("predict_task_id")
+    assert_ok(svc_predict.execute_batch_and_collect_result(task_id), "execute_batch")
+
+    # Step 1: 归档人员开始复制旧文件（复制到一半，尚未确认）
+    r1 = svc_predict.begin_prediction_archive(task_id, operator="归档人员")
+    assert_ok(r1, "begin_prediction_archive")
+    archive_a = r1.get("archive_id")
+    assert r1.get("copied_rows") < r1.get("row_count"), "首笔归档应停在复制到一半"
+
+    # Step 2: 值班人员提交同一批预测的分数更正
+    target_row = svc_predict.prediction_detail(task_id)["rows"][0]["prediction_id"]
+    r2 = svc_predict.correct_prediction_score(task_id, target_row, "0.91", "值班复核改分")
+    assert_ok(r2, "correct_prediction_score")
+
+    # Step 3: 又点了一次导出 → 第二笔归档直接确认，存档地址可辨别是哪次保存
+    r3 = svc_predict.archive_predictions(task_id, operator="值班人员")
+    assert_ok(r3, "archive_predictions")
+    archive_b = r3.get("archive_id")
+    assert r3.get("archive_path") != r1.get("archive_path"), "存档地址应能辨别是哪次保存的"
+
+    # Step 4: 两笔归档冲突，查询应说明哪笔已经具备可恢复副本
+    h1 = svc_predict.archive_history(task_id)
+    assert_ok(h1, "archive_history")
+    assert h1.get("current_archive_id") == archive_b, "已确认的第二笔才是可恢复副本"
+    states = {a["archive_id"]: a["recoverable"] for a in h1.get("archives", [])}
+    assert states.get(archive_a) is False and states.get(archive_b) is True
+    assert h1.get("conflict"), "应给出冲突说明"
+
+    # Step 5: 截停初次复制
+    r5 = svc_predict.stop_prediction_archive(archive_a)
+    assert_ok(r5, "stop_prediction_archive")
+
+    # Step 6: 补一条分数后刷新预测详情
+    second_row = svc_predict.prediction_detail(task_id)["rows"][1]["prediction_id"]
+    assert_ok(svc_predict.correct_prediction_score(task_id, second_row, "0.88", "补录一条改分"))
+    detail = svc_predict.prediction_detail(task_id)
+    scores = {row["prediction_id"]: row["score"] for row in detail.get("rows", [])}
+    assert scores.get(target_row) == "0.91" and scores.get(second_row) == "0.88"
+
+    # Step 7: 返回历史记录并重试 → 第三笔归档确认成功
+    h2 = svc_predict.archive_history(task_id)
+    assert_ok(h2, "archive_history retry")
+    r7 = svc_predict.archive_predictions(task_id, operator="归档人员")
+    assert_ok(r7, "archive_predictions retry")
+    archive_c = r7.get("archive_id")
+
+    # Step 8: 已领取的结果再次读取仍有原先那组预测行
+    first_read = svc_predict.open_prediction_archive(archive_b)
+    assert_ok(first_read, "open archive_b")
+    first_read["rows"][0]["score"] = "9.99"  # 调用方改动不应污染存档
+    second_read = svc_predict.open_prediction_archive(archive_b)
+    assert_ok(second_read, "reopen archive_b")
+    assert second_read.get("rows") != first_read.get("rows") or \
+        second_read["rows"][0]["score"] != "9.99", "已领取结果再次读取应仍是原先那组预测行"
+    archived_scores = {row["prediction_id"]: row["score"] for row in second_read.get("rows", [])}
+    assert archived_scores.get(target_row) == "0.91", "第二笔归档定格在首次改分后"
+    assert archived_scores.get(second_row) != "0.88", "回查旧档时原有分数不会变成补正后的值"
+
+    # Step 9: 未完成的副本在历史详情里无法当作完整数据打开
+    blocked = svc_predict.open_prediction_archive(archive_a)
+    assert not blocked.get("ok"), "截停的副本不能当作完整数据打开"
+
+    # Step 10: 按归档索引回查两代数据及改分依据，回到相应预测批次
+    recall = svc_predict.recall_two_generations(task_id)
+    assert_ok(recall, "recall_two_generations")
+    assert recall.get("task_id") == task_id and recall.get("任务编号")
+    gens = [g["generation"] for g in recall.get("generations", [])]
+    assert gens == [r3.get("generation"), r7.get("generation")]
+    changed = {row["prediction_id"] for row in recall.get("changed_rows", [])}
+    assert second_row in changed, "两代之间的补录改分应被读出"
+    reasons = [c.get("reason") for c in recall.get("corrections", [])]
+    assert "补录一条改分" in reasons, "应带回改分依据"
+
+    # Step 11: 持久化的索引仍指向已确认的那份预测数据
+    h3 = svc_predict.archive_history(task_id)
+    assert h3.get("current_archive_id") == archive_c
+    reopened = svc_predict.open_prediction_archive(archive_b)
+    assert {r["prediction_id"]: r["score"] for r in reopened["rows"]}.get(second_row) != "0.88"
+
+    # Step 12: 归档索引与落库数据不一致时不记成功
+    from app.store import store as _store
+    r12 = svc_predict.begin_prediction_archive(task_id, operator="归档人员")
+    bad_archive = r12.get("archive_id")
+    _store.internal("predict_archive_data", {})[bad_archive]["rows"].pop()
+    r13 = svc_predict.confirm_prediction_archive(bad_archive)
+    assert not r13.get("ok"), "索引与落库不一致时不能记成功"
+    assert not svc_predict.open_prediction_archive(bad_archive).get("ok")
+
+    # Step 13: 数据导出模块的预测导出归档也走同一套归档索引
+    r14 = svc_predict.export_predictions_to_csv(task_id)
+    assert_ok(r14, "export_predictions_to_csv")
+    r15 = svc_export.archive_export_to_storage(r14.get("export_id"))
+    assert_ok(r15, "archive_export_to_storage")
+    assert r15.get("archive_id") and "gen-" in r15.get("archive_path", ""), \
+        "预测导出归档应登记索引并带代次存档地址"
+
+
 if __name__ == "__main__":
     tests = [
         test_chain1_source_to_snapshot,
@@ -243,6 +350,7 @@ if __name__ == "__main__":
         test_chain7_snapshot_restore,
         test_chain8_schedule_and_export,
         test_chain9_corr_to_selection,
+        test_chain10_predict_archive_recall,
     ]
     passed = 0
     failed = 0

@@ -14,9 +14,14 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        self._internal: dict[str, Any] = {}
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
+
+    def internal(self, name: str, default: Any) -> Any:
+        """领域内部数据区（归档索引、落库快照等）：不进入业务模块清单与概览统计。"""
+        return self._internal.setdefault(name, default)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
